@@ -1,0 +1,92 @@
+name: Build King VPN APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-apk:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract source and find the app folder
+        run: |
+          set -e
+          if [ -f package.json ]; then
+            echo "APP_DIR=$PWD" >> "$GITHUB_ENV"
+            echo "App source is at the repository root."
+            exit 0
+          fi
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
+          if [ -n "$ZIP" ]; then
+            echo "Extracting $ZIP ..."
+            rm -rf _src && mkdir -p _src
+            unzip -q -o "$ZIP" -d _src
+            DIR=$(find _src -maxdepth 3 -name package.json -printf '%h\n' | head -n 1)
+          else
+            DIR=$(find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' -printf '%h\n' | head -n 1)
+          fi
+          if [ -z "$DIR" ]; then
+            echo "::error::No package.json found. Upload king-vpn-source.zip to the repository."
+            exit 1
+          fi
+          echo "APP_DIR=$PWD/$DIR" >> "$GITHUB_ENV"
+          echo "App source found at $DIR"
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Java 17 (temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: |
+          cd "$APP_DIR"
+          npm install --no-audit --no-fund
+
+      - name: Generate the Android project
+        env:
+          CI: "1"
+          EXPO_NO_TELEMETRY: "1"
+        run: |
+          cd "$APP_DIR"
+          npx expo prebuild --platform android --non-interactive
+
+      - name: Build the APK
+        env:
+          CI: "1"
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
+        run: |
+          cd "$APP_DIR/android"
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon || ./gradlew assembleDebug --no-daemon
+
+      - name: Collect the APK
+        run: |
+          mkdir -p output
+          APK=$(find "$APP_DIR/android/app/build/outputs/apk" -name "*.apk" | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK was produced."
+            exit 1
+          fi
+          cp "$APK" output/king-vpn.apk
+          ls -lh output
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: king-vpn-apk
+          path: output/king-vpn.apk
+          if-no-files-found: error
