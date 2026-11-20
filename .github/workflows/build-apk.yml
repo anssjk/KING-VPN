@@ -1,1 +1,75 @@
+```yaml
+name: Build King VPN APK
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract source
+        run: |
+          mkdir -p _src
+          ZIP=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -n 1)
+          if [ -n "$ZIP" ]; then
+            unzip -q "$ZIP" -d _src
+          else
+            mkdir -p _src/repo
+            cp -r . _src/repo
+          fi
+          DIR=$(find _src -name package.json -not -path '*/node_modules/*' -printf '%h\n' | head -n 1)
+          if [ -z "$DIR" ]; then
+            echo "package.json not found"
+            exit 1
+          fi
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install dependencies
+        run: |
+          cd "$PROJECT_DIR"
+          npm install
+
+      - name: Prebuild Android
+        run: |
+          cd "$PROJECT_DIR"
+          npx expo prebuild --platform android --non-interactive
+
+      - name: Build APK
+        run: |
+          cd "$PROJECT_DIR/android"
+          chmod +x gradlew
+          ./gradlew assembleRelease || ./gradlew assembleDebug
+
+      - name: Collect APK
+        run: |
+          mkdir -p output
+          APK=$(find "$PROJECT_DIR/android/app/build/outputs/apk" -name '*.apk' | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "APK not found"
+            exit 1
+          fi
+          cp "$APK" output/king-vpn.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: king-vpn-apk
+          path: output/king-vpn.apk
+```
