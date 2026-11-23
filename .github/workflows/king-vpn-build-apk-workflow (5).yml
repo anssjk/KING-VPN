@@ -1,0 +1,172 @@
+name: Build KING VPN APK
+
+# ساخت APK اندروید روی سرور گیت‌هاب — بدون کامپیوتر و بدون Termux.
+# روش استفاده در فایل GITHUB_ACTIONS_GUIDE.md توضیح داده شده است.
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'آدرس پنل (اختیاری) — خالی بگذارید تا از Secrets خوانده شود'
+        required: false
+        default: ''
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CI: '1'
+  EXPO_NO_TELEMETRY: '1'
+  NODE_OPTIONS: '--max-old-space-size=4096'
+
+jobs:
+  build-apk:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ۱) پیدا کردن سورس: یا در ریشه‌ی ریپو، یا داخل یک فایل zip.
+      - name: Locate the app source
+        run: |
+          set -e
+          if [ -f package.json ]; then
+            echo "APP_DIR=$PWD" >> "$GITHUB_ENV"; exit 0
+          fi
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
+          if [ -n "$ZIP" ]; then
+            rm -rf _src && mkdir -p _src && unzip -q -o "$ZIP" -d _src
+            DIR=$(find _src -maxdepth 3 -name package.json -not -path '*/node_modules/*' -printf '%h\n' | head -n 1)
+          else
+            DIR=$(find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' -printf '%h\n' | head -n 1)
+          fi
+          if [ -z "$DIR" ]; then
+            echo "::error::هیچ package.json پیدا نشد. فایل zip پروژه را در ریشه‌ی ریپازیتوری آپلود کنید."
+            exit 1
+          fi
+          echo "APP_DIR=$PWD/$DIR" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # ماژول تونل فایل .so آماده دارد، پس AGP تسک strip را اجرا می‌کند و به NDK
+      # نیاز دارد. نسخه‌ی پین‌شده روی ایمیج رانر نیست و نبودش خطای مبهم می‌دهد.
+      - name: Install the pinned Android NDK
+        run: |
+          set -e
+          NDK_VERSION="27.1.12297006"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK_ROOT/ndk/$NDK_VERSION" ]; then
+            yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          fi
+          ls -1 "$SDK_ROOT/ndk"
+
+      - name: Install dependencies
+        run: |
+          cd "$APP_DIR"
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund
+          else npm install --no-audit --no-fund; fi
+
+      # ۲) دو کتابخانه‌ی نیتیو تونل (~۶۰ مگابایت) داخل zip نیستند چون از سقف آپلود
+      #    گیت‌هاب بزرگ‌ترند؛ اینجا دانلود و با SHA-256 بررسی می‌شوند.
+      - name: Fetch the native tunnel libraries
+        run: |
+          cd "$APP_DIR"
+          bash scripts/fetch-native-libs.sh
+
+      # ۳) ساخت پروژه‌ی نیتیو اندروید از روی app.json
+      - name: Generate the Android project
+        env:
+          EXPO_PUBLIC_API_URL: ${{ inputs.api_url || secrets.EXPO_PUBLIC_API_URL }}
+        run: |
+          cd "$APP_DIR"
+          npx expo prebuild --platform android --no-install --clean
+
+      - name: Configure Gradle memory
+        run: |
+          set -e
+          PROPS="$APP_DIR/android/gradle.properties"
+          [ -f "$PROPS" ] || { echo "::error::prebuild فایل gradle.properties را نساخت."; exit 1; }
+          if grep -q '^org.gradle.jvmargs=' "$PROPS"; then
+            sed -i 's|^org.gradle.jvmargs=.*|org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g|' "$PROPS"
+          else
+            printf '\norg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g\n' >> "$PROPS"
+          fi
+          grep -n 'org.gradle.jvmargs' "$PROPS"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # ۴) ساخت APK. هیچ fallback یا || نیست تا خطای واقعی Gradle دیده شود.
+      - name: Build the APK
+        env:
+          EXPO_PUBLIC_API_URL: ${{ inputs.api_url || secrets.EXPO_PUBLIC_API_URL }}
+        run: |
+          cd "$APP_DIR/android"
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      # ۵) برداشتن APK و اطمینان از امضا (APK بدون امضا روی گوشی نصب نمی‌شود).
+      - name: Collect and verify the APK
+        run: |
+          set -e
+          mkdir -p output
+          APK=$(find "$APP_DIR/android/app/build/outputs/apk/release" -name "*.apk" | head -n 1)
+          [ -n "$APK" ] || { echo "::error::هیچ APK تولید نشد."; exit 1; }
+          cp "$APK" output/king-vpn.apk
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          APKSIGNER=$(find "$SDK_ROOT/build-tools" -name apksigner -type f | sort -V | tail -n 1)
+          if [ -n "$APKSIGNER" ] && ! "$APKSIGNER" verify output/king-vpn.apk > /dev/null 2>&1; then
+            echo "APK امضا نشده بود؛ با keystore دیباگ امضا می‌شود."
+            KS="$APP_DIR/android/app/debug.keystore"
+            [ -f "$KS" ] || keytool -genkeypair -v -storetype PKCS12 -keystore "$KS" \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            "$APKSIGNER" sign --ks "$KS" --ks-pass pass:android --ks-key-alias androiddebugkey \
+              --key-pass pass:android --out output/signed.apk output/king-vpn.apk
+            mv output/signed.apk output/king-vpn.apk
+            "$APKSIGNER" verify output/king-vpn.apk
+          fi
+          ls -lh output
+          {
+            echo "### ✅ APK آماده شد"
+            echo ""
+            echo "حجم: $(du -h output/king-vpn.apk | cut -f1)"
+            echo ""
+            echo "از بخش **Artifacts** پایین همین صفحه یا از تب **Releases** دانلود کنید."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: king-vpn-apk
+          path: output/king-vpn.apk
+          if-no-files-found: error
+          retention-days: 90
+
+      # ۶) لینک دانلود مستقیم برای باز کردن روی گوشی.
+      - name: Publish a download link (Releases)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="apk-${{ github.run_number }}"
+          if ! gh release create "$TAG" output/king-vpn.apk \
+            --title "KING VPN APK (build ${{ github.run_number }})" \
+            --notes "APK ساخته‌شده به‌صورت خودکار از سورس‌کد. برای نصب، فایل king-vpn.apk را دانلود کنید." \
+            --latest; then
+            gh release upload "$TAG" output/king-vpn.apk --clobber
+          fi
